@@ -687,7 +687,7 @@
       var medals = ['&#129351;', '&#129352;', '&#129353;'];
       agentList.forEach(function(name, i) {
         var info = agentMap[name];
-        var has = info && info.total > 0;
+        var has = info && info.count > 0;
         var nc = 'off';
         if (i === 0) nc = 'n1';
         else if (i === 1) nc = 'n2';
