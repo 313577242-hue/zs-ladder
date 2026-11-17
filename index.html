@@ -424,7 +424,7 @@
       <button class="modal-btn confirm" id="btnCloudUp" onclick="cloudUpload()">&#9729; 上传到云端</button>
       <button class="modal-btn confirm" id="btnCloudDown" onclick="cloudDownload()">&#9729; 从云端同步</button>
     </div>
-    <div style="text-align:center;margin-top:8px;font-size:12px;color:var(--light)">从云端同步会保留本机记录并合并</div>
+    <div style="text-align:center;margin-top:8px;font-size:12px;color:var(--light)">已配置后自动同步；离线录入联网后补传</div>
     <div style="text-align:center;margin-top:8px;">
       <button class="link-btn" onclick="showCloudConfig()">云端配置</button>
     </div>
@@ -441,7 +441,7 @@
     <div class="cloud-form">
       <div class="modal-group">
         <label>GitHub Token</label>
-        <input type="text" class="modal-input" id="cfgToken" placeholder="ghp_...">
+        <input type="password" autocomplete="off" class="modal-input" id="cfgToken" placeholder="ghp_...">
       </div>
       <div class="modal-group">
         <label>用户名</label>
@@ -478,19 +478,86 @@
   // 默认 5 个人名
   var DEFAULT_AGENTS = ['张伟', '李娜', '王强', '刘洋', '陈静'];
 
+  function normalizeBusinessData(source) {
+    if (!source || !Array.isArray(source.agents) || !Array.isArray(source.records)) {
+      throw new Error('数据格式不正确，原数据已保留');
+    }
+    function nameOf(name) {
+      if (typeof name !== 'string' || !name.trim()) throw new Error('人员姓名格式不正确');
+      return name === '闻老师' ? '闻老板' : name;
+    }
+    function validDate(value) {
+      if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+      var y = Number(value.slice(0, 4)), m = Number(value.slice(5, 7)), d = Number(value.slice(8, 10));
+      var days = [31, (y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0)) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+      return y >= 1 && m >= 1 && m <= 12 && d >= 1 && d <= days[m - 1];
+    }
+    var ids = new Set();
+    var records = [];
+    source.records.forEach(function(record) {
+      if (!record || typeof record.id !== 'string' || !record.id || ids.has(record.id) ||
+          !Number.isFinite(record.amount) || !validDate(record.date) || !Number.isFinite(record.createdAt)) {
+        throw new Error('记录格式不正确或编号重复，原数据已保留');
+      }
+      ids.add(record.id);
+      var next = Object.assign({}, record, { agent: nameOf(record.agent) });
+      if (next.id === '17902418691306ixf') {
+        // 已确认是改名时的累计转入；仅移除原记录，变动过的记录必须人工核查。
+        if (next.agent !== '闻老板' || next.amount !== -640 || next.date !== '2026-09-24' ||
+            next.createdAt !== 1790241869130 || Object.keys(next).length !== 5) {
+          throw new Error('累计转入记录已改动，请先核查；原数据已保留');
+        }
+        return;
+      }
+      records.push(next);
+    });
+    return { agents: Array.from(new Set(source.agents.map(nameOf))), records: records };
+  }
+
+  var hadStoredDataAtLoad = false;
+  var dataLoadError = false;
   function loadData() {
     try {
-      var d = JSON.parse(localStorage.getItem(STORE_KEY));
-      if (d && d.agents && d.records) return d;
-    } catch(e) {}
+      var raw = localStorage.getItem(STORE_KEY);
+      hadStoredDataAtLoad = raw !== null;
+      if (raw !== null) {
+        var original = JSON.parse(raw);
+        var business = normalizeBusinessData(original);
+        var next = Object.assign({}, original, business);
+        if (JSON.stringify(original) !== JSON.stringify(next)) {
+          if (!localStorage.getItem('zs_ladder_before_monthly_fix')) {
+            localStorage.setItem('zs_ladder_before_monthly_fix', raw);
+          }
+          localStorage.setItem(STORE_KEY, JSON.stringify(next));
+        }
+        return next;
+      }
+    } catch (error) {
+      dataLoadError = true;
+    }
     return { agents: DEFAULT_AGENTS.slice(), records: [] };
   }
 
   var data = loadData();
 
-  function saveData(d) {
-    localStorage.setItem(STORE_KEY, JSON.stringify(d));
+  function copyData() { return JSON.parse(JSON.stringify(data)); }
+  function saveData(next) {
+    try {
+      commitLocalData(next);
+      return true;
+    } catch (error) {
+      showToast('保存失败：' + error.message);
+      return false;
+    }
   }
+
+
+  function htmlEscape(value) {
+    return String(value).replace(/[&<>"']/g, function(c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function htmlArg(value) { return htmlEscape(JSON.stringify(value)); }
 
   // ===== Date helpers =====
   function pad(n) { return (n < 10 ? '0' : '') + n; }
@@ -614,7 +681,7 @@
 
   // ===== Day (记录流) =====
   function renderDay() {
-    var records = data.records.filter(function(r) { return isSameDay(new Date(r.date), currentDate); });
+    var records = data.records.filter(function(r) { return r.date === fmtDate(currentDate); });
     records.sort(function(a, b) { return b.createdAt - a.createdAt; });
     var total = records.reduce(function(s, r) { return s + r.amount; }, 0);
 
@@ -641,9 +708,9 @@
     } else {
       records.forEach(function(r) {
         html += '<div class="record-item">';
-        html += '<div class="left"><div class="agent-name">' + r.agent + '</div><div class="record-meta">' + r.date + ' 录入</div></div>';
+        html += '<div class="left"><div class="agent-name">' + htmlEscape(r.agent) + '</div><div class="record-meta">' + r.date + ' 录入</div></div>';
         html += '<div class="amount-display">' + fmtMoney(r.amount) + '</div>';
-        html += '<button class="del-btn" onclick="requireAuth(function(){deleteRecord(\'' + r.id + '\')})">&#10005;</button>';
+        html += '<button class="del-btn" onclick="requireAuth(function(){deleteRecord(' + htmlArg(r.id) + ')})">&#10005;</button>';
         html += '</div>';
       });
     }
@@ -655,7 +722,7 @@
     var total = records.reduce(function(s, r) { return s + r.amount; }, 0);
 
     // 统计每人
-    var agentMap = {};
+    var agentMap = Object.create(null);
     records.forEach(function(r) {
       if (!agentMap[r.agent]) agentMap[r.agent] = { total: 0, count: 0 };
       agentMap[r.agent].total += r.amount;
@@ -663,7 +730,7 @@
     });
 
     // 所有登记在册的人（包含无业绩的）按业绩降序
-    var agentList = data.agents.slice().sort(function(a, b) {
+    var agentList = Array.from(new Set(data.agents.concat(records.map(function(r) { return r.agent; })))).sort(function(a, b) {
       var ta = agentMap[a] ? agentMap[a].total : 0;
       var tb = agentMap[b] ? agentMap[b].total : 0;
       return tb - ta;
@@ -671,7 +738,7 @@
 
     var html = '';
     html += '<div class="summary-card">';
-    html += '<div class="label">' + periodText + '业绩总额</div>';
+    html += '<div class="label">' + periodText + '加减净额</div>';
     html += '<div class="amount">' + fmtMoney(total) + '</div>';
     html += '<div class="meta">';
     html += '<span class="meta-item">总笔数<b class="green">' + records.length + '</b></span>';
@@ -694,8 +761,8 @@
         else if (i === 2) nc = 'n3';
         html += '<div class="rank-item">';
         html += '<div class="rank-num ' + nc + '">' + (i+1) + '</div>';
-        html += '<div class="rank-info" onclick="openPeriodDetail(\'' + name + '\',\'' + currentDate.getFullYear() + '\',\'' + (currentDate.getMonth()+1) + '\',\'' + currentTab + '\')">';
-        html += '<div class="rank-name">' + name + (i < 3 ? ' ' + medals[i] : '') + '</div>';
+        html += '<div class="rank-info" onclick="openPeriodDetail(' + htmlArg(name) + ',' + currentDate.getFullYear() + ',' + (currentDate.getMonth()+1) + ',' + htmlArg(currentTab) + ')">';
+        html += '<div class="rank-name">' + htmlEscape(name) + (i < 3 ? ' ' + medals[i] : '') + '</div>';
         html += '<div class="rank-count">' + (has ? info.count + ' 笔' : '暂无业绩') + '</div>';
         html += '</div>';
         html += has ? '<div class="rank-amount">' + fmtMoney(info.total) + '</div>' : '<div class="rank-amount none">0.00</div>';
@@ -706,7 +773,7 @@
   }
 
   function renderMonth() {
-    var records = data.records.filter(function(r) { return isSameMonth(new Date(r.date), currentDate); });
+    var records = data.records.filter(function(r) { return r.date.slice(0, 7) === fmtDate(currentDate).slice(0, 7); });
     var html = '';
     html += '<div class="date-bar">';
     html += '<button class="arrow" onclick="shiftMonth(-1)">&#9664;</button>';
@@ -718,7 +785,7 @@
   }
 
   function renderYear() {
-    var records = data.records.filter(function(r) { return isSameYear(new Date(r.date), currentDate); });
+    var records = data.records.filter(function(r) { return r.date.slice(0, 4) === String(currentDate.getFullYear()); });
     var html = '';
     html += '<div class="date-bar">';
     html += '<button class="arrow" onclick="shiftYear(-1)">&#9664;</button>';
@@ -731,8 +798,8 @@
 
   // ===== Date Shift =====
   window.shiftDate = function(n) { currentDate.setDate(currentDate.getDate() + n); render(); };
-  window.shiftMonth = function(n) { currentDate.setMonth(currentDate.getMonth() + n); render(); };
-  window.shiftYear = function(n) { currentDate.setFullYear(currentDate.getFullYear() + n); render(); };
+  window.shiftMonth = function(n) { currentDate.setMonth(currentDate.getMonth() + n, 1); render(); };
+  window.shiftYear = function(n) { currentDate.setFullYear(currentDate.getFullYear() + n, currentDate.getMonth(), 1); render(); };
 
   // ===== Tab Switch =====
   var tabs = document.querySelectorAll('.tab');
@@ -756,7 +823,7 @@
     var sel = document.getElementById('recordAgent');
     sel.innerHTML = '<option value="">请选择人员</option>';
     data.agents.forEach(function(a) {
-      sel.innerHTML += '<option value="' + a + '">' + a + '</option>';
+      sel.innerHTML += '<option value="' + htmlEscape(a) + '">' + htmlEscape(a) + '</option>';
     });
     document.getElementById('recordAmount').value = '';
     document.getElementById('recordDate').value = fmtDate(new Date());
@@ -769,25 +836,27 @@
     var date = document.getElementById('recordDate').value;
 
     if (!agent) { showToast('请选择人员'); return; }
-    if (isNaN(amount)) { showToast('请输入有效金额'); return; }
+    if (!Number.isFinite(amount)) { showToast('请输入有效金额'); return; }
     if (!date) { showToast('请选择日期'); return; }
 
-    data.records.push({
+    var next = copyData();
+    next.records.push({
       id: Date.now().toString() + Math.random().toString(36).slice(2, 6),
       agent: agent,
       amount: amount,
       date: date,
       createdAt: Date.now()
     });
-    saveData(data);
+    if (!saveData(next)) return;
     closeModal('recordModal');
     showToast('业绩添加成功');
     render();
   };
 
   window.deleteRecord = function(id) {
-    data.records = data.records.filter(function(r) { return r.id !== id; });
-    saveData(data);
+    var next = copyData();
+    next.records = next.records.filter(function(r) { return r.id !== id; });
+    if (!saveData(next)) return;
     showToast('已删除');
     render();
     if (detailPeriod) refreshDetailModal();
@@ -798,10 +867,9 @@
 
   window.openPeriodDetail = function(agent, year, month, tab) {
     var records = data.records.filter(function(r) {
-      var d = new Date(r.date);
       if (r.agent !== agent) return false;
-      if (d.getFullYear() !== parseInt(year)) return false;
-      if (tab === 'month' && d.getMonth() + 1 !== parseInt(month)) return false;
+      if (r.date.slice(0, 4) !== String(year)) return false;
+      if (tab === 'month' && Number(r.date.slice(5, 7)) !== Number(month)) return false;
       return true;
     });
     records.sort(function(a, b) { return b.createdAt - a.createdAt; });
@@ -825,13 +893,13 @@
     list.innerHTML = records.map(function(r) {
       return '<div class="detail-item">' +
         '<div class="d-left">' +
-          '<div class="d-name">' + r.agent + '</div>' +
+          '<div class="d-name">' + htmlEscape(r.agent) + '</div>' +
           '<div class="d-meta">' + r.date + '</div>' +
         '</div>' +
         '<div class="d-amount">' + fmtMoney(r.amount) + '</div>' +
         '<div class="d-actions">' +
-          '<button class="d-btn edit" onclick="requireAuth(function(){openEditModal(\'' + r.id + '\')})">&#9998;</button>' +
-          '<button class="d-btn del" onclick="requireAuth(function(){removeRecordDetail(\'' + r.id + '\')})">&#10005;</button>' +
+          '<button class="d-btn edit" onclick="requireAuth(function(){openEditModal(' + htmlArg(r.id) + ')})">&#9998;</button>' +
+          '<button class="d-btn del" onclick="requireAuth(function(){removeRecordDetail(' + htmlArg(r.id) + ')})">&#10005;</button>' +
         '</div>' +
       '</div>';
     }).join('');
@@ -840,10 +908,9 @@
   function refreshDetailModal() {
     if (!detailPeriod) return;
     var records = data.records.filter(function(r) {
-      var d = new Date(r.date);
       if (r.agent !== detailPeriod.agent) return false;
-      if (d.getFullYear() !== detailPeriod.year) return false;
-      if (detailPeriod.month !== undefined && d.getMonth() + 1 !== detailPeriod.month) return false;
+      if (r.date.slice(0, 4) !== String(detailPeriod.year)) return false;
+      if (detailPeriod.month !== undefined && Number(r.date.slice(5, 7)) !== detailPeriod.month) return false;
       return true;
     });
     records.sort(function(a, b) { return b.createdAt - a.createdAt; });
@@ -854,8 +921,9 @@
   }
 
   window.removeRecordDetail = function(id) {
-    data.records = data.records.filter(function(r) { return r.id !== id; });
-    saveData(data);
+    var next = copyData();
+    next.records = next.records.filter(function(r) { return r.id !== id; });
+    if (!saveData(next)) return;
     showToast('已删除');
     refreshDetailModal();
     render();
@@ -877,15 +945,16 @@
     var amount = parseFloat(document.getElementById('editAmount').value);
     var date = document.getElementById('editDate').value;
 
-    if (isNaN(amount)) { showToast('请输入有效金额'); return; }
+    if (!Number.isFinite(amount)) { showToast('请输入有效金额'); return; }
     if (!date) { showToast('请选择日期'); return; }
 
-    var rec = data.records.filter(function(r) { return r.id === editingId; })[0];
+    var next = copyData();
+    var rec = next.records.filter(function(r) { return r.id === editingId; })[0];
     if (rec) {
       rec.amount = amount;
       rec.date = date;
     }
-    saveData(data);
+    if (!rec || !saveData(next)) return;
     closeModal('editModal');
     editingId = null;
     showToast('修改成功');
@@ -907,7 +976,7 @@
       return;
     }
     list.innerHTML = data.agents.map(function(a) {
-      return '<span class="agent-chip">' + a + '<button class="remove" onclick="removeAgent(\'' + a + '\')">&times;</button></span>';
+      return '<span class="agent-chip">' + htmlEscape(a) + '<button class="remove" onclick="removeAgent(' + htmlArg(a) + ')">&times;</button></span>';
     }).join('');
   }
 
@@ -915,16 +984,18 @@
     var name = document.getElementById('newAgentName').value.trim();
     if (!name) { showToast('请输入姓名'); return; }
     if (data.agents.indexOf(name) !== -1) { showToast('该人员已存在'); return; }
-    data.agents.push(name);
-    saveData(data);
+    var next = copyData();
+    next.agents.push(name);
+    if (!saveData(next)) return;
     document.getElementById('newAgentName').value = '';
     renderAgentList();
     showToast('已添加：' + name);
   };
 
   window.removeAgent = function(name) {
-    data.agents = data.agents.filter(function(a) { return a !== name; });
-    saveData(data);
+    var next = copyData();
+    next.agents = next.agents.filter(function(a) { return a !== name; });
+    if (!saveData(next)) return;
     renderAgentList();
     showToast('已删除：' + name);
     render();
@@ -952,78 +1023,364 @@
   // ===== Backup & Cloud Sync =====
   var CLOUD_CFG_KEY = 'zs_ladder_cloud_cfg';
   var DATA_FILE = 'data.json';
+  var syncTimer = null;
+  var syncSerial = Promise.resolve();
+  var automaticQueued = false;
+  var automaticAgain = false;
+  var syncBlocked = false;
+  var syncRetryDelay = 15000;
+  var syncMessage = '';
 
+  function syncClone(value) { return JSON.parse(JSON.stringify(value)); }
+  function syncStable(value) {
+    if (Array.isArray(value)) return '[' + value.map(syncStable).join(',') + ']';
+    if (value && typeof value === 'object') {
+      return '{' + Object.keys(value).sort().map(function(key) {
+        return JSON.stringify(key) + ':' + syncStable(value[key]);
+      }).join(',') + '}';
+    }
+    return JSON.stringify(value);
+  }
+  function syncSnapshot(source, allowRestore) {
+    var result = normalizeBusinessData(source);
+    if (source.deletedRecords !== undefined && !Array.isArray(source.deletedRecords)) throw new Error('删除记录格式不正确');
+    if (source.deletedAgents !== undefined && !Array.isArray(source.deletedAgents)) throw new Error('删除人员格式不正确');
+    result.deletedRecords = normalizeBusinessData({ agents: [], records: source.deletedRecords || [] }).records;
+    // 累计转入在业务记录中剔除，但保留其已确认删除标记。
+    (source.deletedRecords || []).forEach(function(record) {
+      if (record.id === '17902418691306ixf') {
+        var marker = syncClone(record);
+        marker.agent = '闻老板';
+        result.deletedRecords.push(marker);
+      }
+    });
+    result.deletedAgents = normalizeBusinessData({ agents: source.deletedAgents || [], records: [] }).agents;
+    var ids = new Set(result.records.map(function(r) { return r.id; }));
+    result.deletedRecords = result.deletedRecords.filter(function(r) {
+      if (ids.has(r.id) && !allowRestore) throw new Error('同一记录同时存在于数据和删除标记中');
+      return !ids.has(r.id);
+    });
+    result.deletedAgents = result.deletedAgents.filter(function(name) {
+      if (result.agents.indexOf(name) !== -1 && !allowRestore) throw new Error('同一人员同时存在于名单和删除标记中');
+      return result.agents.indexOf(name) === -1;
+    });
+    return result;
+  }
+  function syncComparable(source) {
+    return {
+      agents: source.agents.slice().sort(),
+      records: source.records.slice().sort(function(a, b) { return a.id.localeCompare(b.id); }),
+      deletedAgents: (source.deletedAgents || []).slice().sort(),
+      deletedRecords: (source.deletedRecords || []).slice().sort(function(a, b) { return a.id.localeCompare(b.id); })
+    };
+  }
+  function syncEqual(a, b) { return syncStable(a) === syncStable(b); }
+  function syncSameData(a, b) { return syncEqual(syncComparable(a), syncComparable(b)); }
+  function syncTarget(cfg) { return cfg.owner.toLowerCase() + '/' + cfg.repo.toLowerCase() + '/' + DATA_FILE; }
   function getCloudCfg() {
-    try {
-      var raw = localStorage.getItem(CLOUD_CFG_KEY);
-      return raw ? JSON.parse(raw) : {};
-    } catch(e) { return {}; }
+    try { return JSON.parse(localStorage.getItem(CLOUD_CFG_KEY)) || {}; }
+    catch (e) { return {}; }
   }
-  function saveCloudCfgLocal(cfg) { localStorage.setItem(CLOUD_CFG_KEY, JSON.stringify(cfg)); }
-  function getApiUrl() {
+  function hasCloudCfg(cfg) { return !!(cfg.token && cfg.owner && cfg.repo); }
+  function sameCloudCfg(cfg) {
+    var current = getCloudCfg();
+    return current.token === cfg.token && current.owner === cfg.owner && current.repo === cfg.repo;
+  }
+  function assertCloudCfg(cfg) {
+    if (!sameCloudCfg(cfg)) {
+      var error = new Error('云端配置已更改，等待新配置同步');
+      error.code = 'configuration_changed';
+      throw error;
+    }
+  }
+  function getApiUrl(cfg) {
+    return 'https://api.github.com/repos/' + encodeURIComponent(cfg.owner) + '/' + encodeURIComponent(cfg.repo) + '/contents/' + DATA_FILE;
+  }
+  function setSyncMessage(message) { syncMessage = message; updateCloudStatus(); }
+  function updateCloudStatus() {
+    var status = document.getElementById('cloudStatus');
+    if (!status) return;
     var cfg = getCloudCfg();
-    if (!cfg.owner || !cfg.repo) return null;
-    return 'https://api.github.com/repos/' + cfg.owner + '/' + cfg.repo + '/contents/' + DATA_FILE;
+    var meta = data._sync;
+    status.textContent = !hasCloudCfg(cfg) ? '未配置自动同步，请点击下方“云端配置”' :
+      syncMessage || (meta && meta.target === syncTarget(cfg) && meta.lastSync ?
+        '自动同步已开启 · 上次同步：' + new Date(meta.lastSync).toLocaleString('zh-CN') : '自动同步已开启，等待首次同步');
   }
-
+  function syncBackup(label, value) {
+    var key = 'zs_ladder_backup_' + label + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+    localStorage.setItem(key, JSON.stringify(value));
+    return key;
+  }
+  function backupBeforeSync(target) {
+    var raw = localStorage.getItem(STORE_KEY);
+    var backup = raw === null ? JSON.stringify(data) : raw;
+    if (localStorage.getItem('zs_ladder_before_cloud_sync') === null) {
+      localStorage.setItem('zs_ladder_before_cloud_sync', backup);
+    }
+    var key = 'zs_ladder_before_auto_sync_v2_' + encodeURIComponent(target);
+    if (localStorage.getItem(key) === null) localStorage.setItem(key, backup);
+  }
+  function syncConflict(message, base, local, cloud) {
+    var key = syncBackup('conflict', {
+      createdAt: new Date().toISOString(), target: hasCloudCfg(getCloudCfg()) ? syncTarget(getCloudCfg()) : '',
+      base: base, local: local, cloud: cloud
+    });
+    var error = new Error(message + '；本机、云端和基线副本已保留（' + key + '）');
+    error.code = 'conflict';
+    return error;
+  }
+  function syncRecordStates(snapshot) {
+    var states = new Map();
+    if (!snapshot) return states;
+    snapshot.records.forEach(function(record) { states.set(record.id, { live: true, record: record }); });
+    snapshot.deletedRecords.forEach(function(record) { states.set(record.id, { live: false, record: record }); });
+    return states;
+  }
+  function syncAgentStates(snapshot) {
+    var states = new Map();
+    if (!snapshot) return states;
+    snapshot.agents.forEach(function(name) { states.set(name, true); });
+    snapshot.deletedAgents.forEach(function(name) { states.set(name, false); });
+    return states;
+  }
+  function mergeSyncData(base, local, cloud) {
+    var result = { agents: [], records: [], deletedRecords: [], deletedAgents: [] };
+    var baseRecords = syncRecordStates(base), localRecords = syncRecordStates(local), cloudRecords = syncRecordStates(cloud);
+    var ids = new Set(Array.from(localRecords.keys()).concat(Array.from(cloudRecords.keys()), Array.from(baseRecords.keys())));
+    ids.forEach(function(id) {
+      var b = baseRecords.get(id), l = localRecords.get(id), c = cloudRecords.get(id), chosen;
+      if (syncEqual(l, c)) chosen = l;
+      else if (base && syncEqual(l, b)) chosen = c;
+      else if (base && syncEqual(c, b)) chosen = l;
+      else if (!base && !l) chosen = c;
+      else if (!base && !c) chosen = l;
+      else if (!base && l && c && l.live !== c.live && syncEqual(l.record, c.record)) chosen = l.live ? c : l;
+      else if ((!l || !l.live) && (!c || !c.live)) chosen = l || c;
+      else throw syncConflict('记录 ' + id + ' 存在同时修改或删除冲突，已暂停自动同步', base, local, cloud);
+      if (!chosen && b && b.live) chosen = { live: false, record: b.record };
+      if (chosen) result[chosen.live ? 'records' : 'deletedRecords'].push(syncClone(chosen.record));
+    });
+    var baseAgents = syncAgentStates(base), localAgents = syncAgentStates(local), cloudAgents = syncAgentStates(cloud);
+    var names = new Set(Array.from(localAgents.keys()).concat(Array.from(cloudAgents.keys()), Array.from(baseAgents.keys())));
+    names.forEach(function(name) {
+      var b = baseAgents.get(name), l = localAgents.get(name), c = cloudAgents.get(name), chosen;
+      if (l === c) chosen = l;
+      else if (base && l === b) chosen = c;
+      else if (base && c === b) chosen = l;
+      else if (l === undefined) chosen = c;
+      else if (c === undefined) chosen = l;
+      else chosen = false;
+      if (chosen === undefined && b === true) chosen = false;
+      if (chosen !== undefined) result[chosen ? 'agents' : 'deletedAgents'].push(name);
+    });
+    return result;
+  }
+  function commitLocalData(candidate) {
+    if (typeof dataLoadError !== 'undefined' && dataLoadError) throw new Error('本机资料加载或备份失败，已阻止覆盖；请先导出检查原资料');
+    var previous = syncSnapshot(data);
+    var next = syncSnapshot(candidate, true);
+    var activeIds = new Set(next.records.map(function(r) { return r.id; }));
+    var deletedById = new Map(previous.deletedRecords.concat(next.deletedRecords).map(function(r) { return [r.id, r]; }));
+    previous.records.forEach(function(record) { if (!activeIds.has(record.id)) deletedById.set(record.id, record); });
+    next.deletedRecords = Array.from(deletedById.values()).filter(function(r) { return !activeIds.has(r.id); });
+    var deletedNames = new Set(previous.deletedAgents.concat(next.deletedAgents));
+    previous.agents.forEach(function(name) { if (next.agents.indexOf(name) === -1) deletedNames.add(name); });
+    next.deletedAgents = Array.from(deletedNames).filter(function(name) { return next.agents.indexOf(name) === -1; });
+    var storedRaw = localStorage.getItem(STORE_KEY);
+    var stored = storedRaw ? JSON.parse(storedRaw) : null;
+    if (stored && !syncSameData(previous, syncSnapshot(stored))) {
+      next = mergeSyncData(previous, next, syncSnapshot(stored));
+    }
+    if (stored && stored._sync) next._sync = syncClone(stored._sync);
+    else if (data._sync) next._sync = syncClone(data._sync);
+    localStorage.setItem(STORE_KEY, JSON.stringify(next));
+    data = next;
+    hadStoredDataAtLoad = true;
+    syncBlocked = false;
+    setSyncMessage('已保存到本机，等待自动同步');
+    queueCloudSync(800);
+    return true;
+  }
+  function latestLocalSource() {
+    var raw = localStorage.getItem(STORE_KEY);
+    return raw === null ? data : JSON.parse(raw);
+  }
+  function currentSyncSnapshot(source) {
+    var snapshot = syncSnapshot(source);
+    return !hadStoredDataAtLoad && snapshot.records.length === 0 ? syncSnapshot({ agents: [], records: [] }) : snapshot;
+  }
+  function persistSyncResult(snapshot, base, cfg, comparedLocal) {
+    var target = syncTarget(cfg);
+    var latest = currentSyncSnapshot(latestLocalSource());
+    if (!syncSameData(latest, comparedLocal)) snapshot = mergeSyncData(comparedLocal, latest, snapshot);
+    backupBeforeSync(target);
+    var changed = !syncSameData(syncSnapshot(data), snapshot);
+    var next = syncClone(snapshot);
+    next._sync = { target: target, base: syncClone(base), lastSync: new Date().toISOString() };
+    localStorage.setItem(STORE_KEY, JSON.stringify(next));
+    data = next;
+    hadStoredDataAtLoad = true;
+    if (changed) {
+      render();
+      if (detailPeriod) refreshDetailModal();
+      if (typeof renderAgentList === 'function') renderAgentList();
+    }
+    return snapshot;
+  }
+  async function cloudFetch(cfg, options) {
+    assertCloudCfg(cfg);
+    var controller = new AbortController();
+    var timeout = setTimeout(function() { controller.abort(); }, 20000);
+    try {
+      var response = await fetch(getApiUrl(cfg), Object.assign({ cache: 'no-store' }, options, {
+        signal: controller.signal,
+        headers: Object.assign({ 'Authorization': 'Bearer ' + cfg.token, 'Accept': 'application/vnd.github+json' }, options && options.headers)
+      }));
+      assertCloudCfg(cfg);
+      return response;
+    } finally { clearTimeout(timeout); }
+  }
+  async function readCloudSnapshot(cfg) {
+    var response = await cloudFetch(cfg, { method: 'GET' });
+    if (response.status === 404) return { missing: true, snapshot: syncSnapshot({ agents: [], records: [] }) };
+    if (!response.ok) throw new Error('读取云端失败（HTTP ' + response.status + '）');
+    var file = await response.json();
+    assertCloudCfg(cfg);
+    if (typeof file.content !== 'string' || typeof file.sha !== 'string') throw new Error('云端文件格式不正确');
+    var raw = JSON.parse(decodeURIComponent(escape(atob(file.content.replace(/\s/g, '')))));
+    var snapshot = syncSnapshot(raw);
+    var original = { agents: raw.agents, records: raw.records, deletedRecords: raw.deletedRecords || [], deletedAgents: raw.deletedAgents || [] };
+    return { sha: file.sha, snapshot: snapshot, needsRepair: !syncSameData(original, snapshot) };
+  }
+  async function syncCloudOnce(upload) {
+    if (typeof dataLoadError !== 'undefined' && dataLoadError) {
+      var loadError = new Error('本机资料加载或备份失败，已暂停自动同步并保留原资料');
+      loadError.code = 'local_data_error';
+      throw loadError;
+    }
+    var cfg = getCloudCfg();
+    if (!hasCloudCfg(cfg)) { updateCloudStatus(); return; }
+    if (navigator.onLine === false) throw new Error('网络未连接，本机记录已保留');
+    var target = syncTarget(cfg);
+    setSyncMessage(upload ? '正在自动同步…' : '正在读取云端…');
+    for (var attempt = 0; attempt < 3; attempt++) {
+      var remote = await readCloudSnapshot(cfg);
+      if (remote.missing && !upload) throw new Error('云端暂无数据，本机记录已保留');
+      var localSource = latestLocalSource();
+      var current = currentSyncSnapshot(localSource);
+      var base = localSource._sync && localSource._sync.target === target ? syncSnapshot(localSource._sync.base) : null;
+      if (remote.missing && base && (base.records.length || base.agents.length)) {
+        throw syncConflict('云端文件已消失，已暂停自动同步', base, current, remote.snapshot);
+      }
+      var merged = mergeSyncData(base, current, remote.snapshot);
+      if (!upload || (!remote.missing && !remote.needsRepair && syncSameData(merged, remote.snapshot))) {
+        merged = persistSyncResult(merged, remote.snapshot, cfg, current);
+        setSyncMessage(syncSameData(merged, remote.snapshot) ? '自动同步正常 · ' + new Date().toLocaleTimeString('zh-CN') : '云端已读取，本机新增记录等待自动上传');
+        syncRetryDelay = 15000;
+        return;
+      }
+      assertCloudCfg(cfg);
+      backupBeforeSync(target);
+      var payload = Object.assign({ version: 2, syncedAt: new Date().toISOString() }, merged);
+      var body = { message: 'Sync ladder records', content: btoa(unescape(encodeURIComponent(JSON.stringify(payload, null, 2)))) };
+      if (remote.sha) body.sha = remote.sha;
+      var response = await cloudFetch(cfg, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      if (response.status === 409 || response.status === 422) continue;
+      if (!response.ok) throw new Error('上传云端失败（HTTP ' + response.status + '），本机记录已保留');
+      var latest = currentSyncSnapshot(latestLocalSource());
+      var afterUpload = mergeSyncData(current, latest, merged);
+      afterUpload = persistSyncResult(afterUpload, merged, cfg, latest);
+      syncRetryDelay = 15000;
+      if (!syncSameData(afterUpload, merged)) {
+        setSyncMessage('已同步，后续修改等待上传');
+        queueCloudSync(800);
+      } else setSyncMessage('自动同步正常 · ' + new Date().toLocaleTimeString('zh-CN'));
+      return;
+    }
+    throw new Error('云端正在被其他设备修改，本机记录已保留，稍后重试');
+  }
+  function requestCloudSync(upload, manual) {
+    if (!manual && (syncBlocked || automaticQueued)) {
+      if (automaticQueued) automaticAgain = true;
+      return Promise.resolve(false);
+    }
+    if (!manual) automaticQueued = true;
+    else syncBlocked = false;
+    var task = syncSerial.catch(function() {}).then(function() { return syncCloudOnce(upload); });
+    syncSerial = task.catch(function() {});
+    return task.then(function() { return true; }).catch(function(error) {
+      if (error.code === 'configuration_changed') {
+        setSyncMessage(error.message);
+        queueCloudSync(800);
+      } else {
+        syncBlocked = error.code === 'conflict' || error.code === 'local_data_error';
+        setSyncMessage(error.message || '同步失败，本机记录已保留');
+        if (!syncBlocked) {
+          queueCloudSync(syncRetryDelay);
+          syncRetryDelay = Math.min(syncRetryDelay * 2, 60000);
+        }
+      }
+      if (manual) showToast(error.message || '同步失败，本机记录已保留');
+      return false;
+    }).finally(function() {
+      if (!manual) automaticQueued = false;
+      if (automaticAgain && !syncBlocked) { automaticAgain = false; queueCloudSync(800); }
+    });
+  }
+  function queueCloudSync(delay) {
+    clearTimeout(syncTimer);
+    if (syncBlocked || !hasCloudCfg(getCloudCfg())) return;
+    syncTimer = setTimeout(function() { requestCloudSync(true, false); }, delay === undefined ? 800 : delay);
+  }
+  function initAutoSync() {
+    if (typeof dataLoadError !== 'undefined' && dataLoadError) {
+      syncBlocked = true;
+      setSyncMessage('本机资料加载或备份失败，已暂停自动同步并保留原资料');
+      return;
+    }
+    updateCloudStatus();
+    queueCloudSync(300);
+    window.addEventListener('online', function() { queueCloudSync(300); });
+    document.addEventListener('visibilitychange', function() { if (!document.hidden) queueCloudSync(300); });
+    setInterval(function() { if (!document.hidden) queueCloudSync(0); }, 60000);
+  }
   window.openBackupModal = function() {
     updateCloudStatus();
     document.getElementById('backupModal').classList.add('show');
   };
-
-  function updateCloudStatus() {
-    var cfg = getCloudCfg();
-    var status = document.getElementById('cloudStatus');
-    if (!cfg.token || !cfg.owner || !cfg.repo) {
-      status.textContent = '未配置云端同步，请点击下方"云端配置"';
-    } else {
-      var lastSync = cfg.lastSync || '';
-      status.textContent = lastSync ? '上次同步：' + lastSync : '已配置，等待首次同步';
-    }
-  }
-
   window.exportData = function() {
-    var payload = {
-      version: 1,
-      exportedAt: new Date().toISOString(),
-      agents: data.agents,
-      records: data.records
-    };
+    var payload = Object.assign({ version: 2, exportedAt: new Date().toISOString() }, syncSnapshot(data));
     var blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     var url = URL.createObjectURL(blob);
-    var a = document.createElement('a');
-    a.href = url;
-    a.download = '天梯排行榜备份_' + fmtDate(new Date()) + '.json';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    var link = document.createElement('a');
+    link.href = url;
+    link.download = '王争霸赛备份_' + fmtDate(new Date()) + '.json';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
     closeModal('backupModal');
     showToast('备份已下载');
   };
-
   window.importData = function(input) {
     var file = input.files[0];
     if (!file) return;
     var reader = new FileReader();
-    reader.onload = function(e) {
+    reader.onload = function(event) {
       try {
-        var payload = JSON.parse(e.target.result);
-        if (!payload.agents || !payload.records) throw new Error('格式不对');
-        data.agents = payload.agents;
-        data.records = payload.records;
-        saveData(data);
+        var incoming = syncSnapshot(JSON.parse(event.target.result));
+        syncBackup('before_import', syncClone(data));
+        if (!saveData(incoming)) return;
         closeModal('backupModal');
         showToast('恢复成功，共 ' + data.agents.length + ' 人，' + data.records.length + ' 笔记录');
         render();
-      } catch(err) {
-        showToast('文件格式不正确');
-      }
-      input.value = '';
+        if (detailPeriod) refreshDetailModal();
+      } catch (error) { showToast('恢复失败：' + error.message); }
+      finally { input.value = ''; }
     };
+    reader.onerror = function() { input.value = ''; showToast('读取备份失败，本机记录已保留'); };
     reader.readAsText(file);
   };
-
   window.showCloudConfig = function() {
     var cfg = getCloudCfg();
     document.getElementById('cfgToken').value = cfg.token || '';
@@ -1031,145 +1388,46 @@
     document.getElementById('cfgRepo').value = cfg.repo || '';
     document.getElementById('cloudConfigModal').classList.add('show');
   };
-
   window.saveCloudConfig = function() {
     var cfg = {
       token: document.getElementById('cfgToken').value.trim(),
       owner: document.getElementById('cfgOwner').value.trim(),
-      repo: document.getElementById('cfgRepo').value.trim(),
-      lastSync: getCloudCfg().lastSync || ''
+      repo: document.getElementById('cfgRepo').value.trim()
     };
-    if (!cfg.token || !cfg.owner || !cfg.repo) { showToast('请填写完整配置'); return; }
-    saveCloudCfgLocal(cfg);
+    if (!hasCloudCfg(cfg)) { showToast('请填写完整配置'); return; }
+    if (!/^[A-Za-z0-9-]+$/.test(cfg.owner) || !/^[A-Za-z0-9._-]+$/.test(cfg.repo)) { showToast('用户名或仓库名格式不正确'); return; }
+    try { localStorage.setItem(CLOUD_CFG_KEY, JSON.stringify(cfg)); }
+    catch (error) { showToast('配置保存失败：' + error.message); return; }
+    syncBlocked = false;
+    syncMessage = '';
     closeModal('cloudConfigModal');
     updateCloudStatus();
-    showToast('云端配置已保存');
+    showToast('配置已保存，自动同步已开启');
+    queueCloudSync(300);
+  };
+  window.cloudUpload = async function() {
+    if (!hasCloudCfg(getCloudCfg())) { showToast('请先配置云端信息'); showCloudConfig(); return; }
+    var button = document.getElementById('btnCloudUp');
+    button.disabled = true;
+    button.textContent = '同步中…';
+    try { if (await requestCloudSync(true, true)) showToast('云端同步完成，共 ' + data.records.length + ' 笔'); }
+    finally { button.disabled = false; button.textContent = '☁ 立即同步到云端'; }
+  };
+  window.cloudDownload = async function() {
+    if (!hasCloudCfg(getCloudCfg())) { showToast('请先配置云端信息'); showCloudConfig(); return; }
+    var button = document.getElementById('btnCloudDown');
+    button.disabled = true;
+    button.textContent = '读取中…';
+    try { if (await requestCloudSync(false, true)) showToast('云端数据已合并到本机，共 ' + data.records.length + ' 笔'); }
+    finally { button.disabled = false; button.textContent = '☁ 从云端读取'; }
   };
 
-  window.cloudUpload = function() {
-    var cfg = getCloudCfg();
-    if (!cfg.token || !cfg.owner || !cfg.repo) { showToast('请先配置云端信息'); showCloudConfig(); return; }
-    var btn = document.getElementById('btnCloudUp');
-    btn.textContent = '上传中...';
-    btn.disabled = true;
-
-    var payload = JSON.stringify({
-      version: 1,
-      syncedAt: new Date().toISOString(),
-      agents: data.agents,
-      records: data.records
-    });
-    var b64 = btoa(unescape(encodeURIComponent(payload)));
-    var url = getApiUrl();
-    var bodyData = {
-      message: 'Ladder sync ' + new Date().toLocaleString('zh-CN'),
-      content: b64,
-      branch: 'master'
-    };
-    fetch(url, { headers: { 'Authorization': 'token ' + cfg.token } }).then(function(r) {
-      if (r.ok) { return r.json().then(function(d) { bodyData.sha = d.sha; }); }
-      return Promise.resolve();
-    }).then(function() {
-      return fetch(url, {
-        method: 'PUT',
-        headers: { 'Authorization': 'token ' + cfg.token, 'Content-Type': 'application/json' },
-        body: JSON.stringify(bodyData)
-      });
-    }).then(function(r) {
-      btn.textContent = '\u2601 上传到云端';
-      btn.disabled = false;
-      if (r.ok) {
-        var ts = new Date().toLocaleString('zh-CN');
-        cfg.lastSync = ts;
-        saveCloudCfgLocal(cfg);
-        updateCloudStatus();
-        showToast('已同步到云端');
-        closeModal('backupModal');
-      } else {
-        return r.json().then(function(d) { showToast('上传失败: ' + (d.message || 'Network error')); });
-      }
-    }).catch(function(err) {
-      btn.textContent = '\u2601 上传到云端';
-      btn.disabled = false;
-      showToast('上传失败: ' + err.message);
-    });
-  };
-
-  window.cloudDownload = function() {
-    var cfg = getCloudCfg();
-    if (!cfg.token || !cfg.owner || !cfg.repo) { showToast('请先配置云端信息'); showCloudConfig(); return; }
-    var btn = document.getElementById('btnCloudDown');
-    btn.textContent = '下载中...';
-    btn.disabled = true;
-
-    fetch(getApiUrl(), { headers: { 'Authorization': 'token ' + cfg.token } })
-      .then(function(r) {
-        if (!r.ok) { showToast('云端暂无数据'); btn.textContent = '\u2601 从云端同步'; btn.disabled = false; return; }
-        return r.json();
-      })
-      .then(function(d) {
-        if (!d || !d.content) { showToast('云端暂无数据'); btn.textContent = '\u2601 从云端同步'; btn.disabled = false; return; }
-        var decoded = decodeURIComponent(escape(atob(d.content.replace(/\s/g, ''))));
-        var payload = JSON.parse(decoded);
-        var recordsById = new Map();
-        var mergedRecords = [];
-        [data, payload].forEach(function(source) {
-          if (!Array.isArray(source.agents) || !Array.isArray(source.records) ||
-              !source.agents.every(function(name) { return typeof name === 'string'; })) {
-            throw new Error('数据格式不正确');
-          }
-          source.records.forEach(function(record) {
-            if (!record || typeof record.id !== 'string' || !record.id ||
-                typeof record.agent !== 'string' || !Number.isFinite(record.amount) ||
-                typeof record.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(record.date) ||
-                !Number.isFinite(new Date(record.date).getTime()) || !Number.isFinite(record.createdAt)) {
-              throw new Error('记录格式不正确');
-            }
-            if (recordsById.has(record.id)) {
-              var existing = recordsById.get(record.id);
-              var keys = Object.keys(record);
-              if (keys.length !== Object.keys(existing).length || !keys.every(function(key) {
-                return Object.prototype.hasOwnProperty.call(existing, key) &&
-                  JSON.stringify(existing[key]) === JSON.stringify(record[key]);
-              })) {
-                throw new Error('相同编号的记录存在冲突，原数据已保留');
-              }
-            } else {
-              recordsById.set(record.id, record);
-              mergedRecords.push(record);
-            }
-          });
-        });
-        var merged = {
-          agents: Array.from(new Set(data.agents.concat(payload.agents))),
-          records: mergedRecords
-        };
-        // 保留第一次同步前的本机副本，重复同步也不覆盖它。
-        if (!localStorage.getItem('zs_ladder_before_cloud_sync')) {
-          localStorage.setItem('zs_ladder_before_cloud_sync', JSON.stringify(data));
-        }
-        saveData(merged);
-        data = merged;
-        var ts = new Date().toLocaleString('zh-CN');
-        cfg.lastSync = ts;
-        saveCloudCfgLocal(cfg);
-        updateCloudStatus();
-        btn.textContent = '\u2601 从云端同步';
-        btn.disabled = false;
-        showToast('云端同步成功，共 ' + data.agents.length + ' 人，' + data.records.length + ' 笔');
-        closeModal('backupModal');
-        render();
-      })
-      .catch(function(err) {
-        btn.textContent = '\u2601 从云端同步';
-        btn.disabled = false;
-        showToast('同步失败: ' + err.message);
-      });
-  };
 
   // ===== Init =====
   updateDateNow();
   render();
+  initAutoSync();
+  if (dataLoadError) showToast('本机数据读取或保存失败，已停止同步；原始数据保留');
 
 })();
 </script>
