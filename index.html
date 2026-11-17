@@ -424,6 +424,7 @@
       <button class="modal-btn confirm" id="btnCloudUp" onclick="cloudUpload()">&#9729; 上传到云端</button>
       <button class="modal-btn confirm" id="btnCloudDown" onclick="cloudDownload()">&#9729; 从云端同步</button>
     </div>
+    <div style="text-align:center;margin-top:8px;font-size:12px;color:var(--light)">从云端同步会保留本机记录并合并</div>
     <div style="text-align:center;margin-top:8px;">
       <button class="link-btn" onclick="showCloudConfig()">云端配置</button>
     </div>
@@ -616,7 +617,6 @@
     var records = data.records.filter(function(r) { return isSameDay(new Date(r.date), currentDate); });
     records.sort(function(a, b) { return b.createdAt - a.createdAt; });
     var total = records.reduce(function(s, r) { return s + r.amount; }, 0);
-    var catBreakdown = getCatBreakdown(records);
 
     var html = '';
     html += '<div class="date-bar">';
@@ -1111,10 +1111,45 @@
         if (!d || !d.content) { showToast('云端暂无数据'); btn.textContent = '\u2601 从云端同步'; btn.disabled = false; return; }
         var decoded = decodeURIComponent(escape(atob(d.content.replace(/\s/g, ''))));
         var payload = JSON.parse(decoded);
-        if (!payload.agents || !payload.records) throw new Error('Data format error');
-        data.agents = payload.agents;
-        data.records = payload.records;
-        saveData(data);
+        var recordsById = new Map();
+        var mergedRecords = [];
+        [data, payload].forEach(function(source) {
+          if (!Array.isArray(source.agents) || !Array.isArray(source.records) ||
+              !source.agents.every(function(name) { return typeof name === 'string'; })) {
+            throw new Error('数据格式不正确');
+          }
+          source.records.forEach(function(record) {
+            if (!record || typeof record.id !== 'string' || !record.id ||
+                typeof record.agent !== 'string' || !Number.isFinite(record.amount) ||
+                typeof record.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(record.date) ||
+                !Number.isFinite(new Date(record.date).getTime()) || !Number.isFinite(record.createdAt)) {
+              throw new Error('记录格式不正确');
+            }
+            if (recordsById.has(record.id)) {
+              var existing = recordsById.get(record.id);
+              var keys = Object.keys(record);
+              if (keys.length !== Object.keys(existing).length || !keys.every(function(key) {
+                return Object.prototype.hasOwnProperty.call(existing, key) &&
+                  JSON.stringify(existing[key]) === JSON.stringify(record[key]);
+              })) {
+                throw new Error('相同编号的记录存在冲突，原数据已保留');
+              }
+            } else {
+              recordsById.set(record.id, record);
+              mergedRecords.push(record);
+            }
+          });
+        });
+        var merged = {
+          agents: Array.from(new Set(data.agents.concat(payload.agents))),
+          records: mergedRecords
+        };
+        // 保留第一次同步前的本机副本，重复同步也不覆盖它。
+        if (!localStorage.getItem('zs_ladder_before_cloud_sync')) {
+          localStorage.setItem('zs_ladder_before_cloud_sync', JSON.stringify(data));
+        }
+        saveData(merged);
+        data = merged;
         var ts = new Date().toLocaleString('zh-CN');
         cfg.lastSync = ts;
         saveCloudCfgLocal(cfg);
